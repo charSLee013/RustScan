@@ -62,7 +62,7 @@ impl Scanner {
         let mut socket_iterator: SocketIterator = SocketIterator::new(&self.ips, &ports);
         let mut open_sockets: Vec<SocketAddr> = Vec::new();
         let mut ftrs = FuturesUnordered::new();
-        let mut errors: HashSet<String> = HashSet::with_capacity(self.ips.len() * 1000);
+        // let mut errors: HashSet<String> = HashSet::with_capacity(1);
 
         for _ in 0..self.batch_size {
             if let Some(socket) = socket_iterator.next() {
@@ -85,15 +85,15 @@ impl Scanner {
 
             match result {
                 Ok(socket) => open_sockets.push(socket),
-                Err(e) => {
-                    let error_string = e.to_string();
-                    if errors.len() < self.ips.len() * 1000 {
-                        errors.insert(error_string);
-                    }
+                Err(_) => {
+                    // let error_string = e.to_string();
+                    // if errors.len() < self.ips.len() * 1000 {
+                    //     errors.insert(error_string);
+                    // }
                 }
             }
         }
-        debug!("Typical socket connection errors {:?}", errors);
+        // debug!("Typical socket connection errors {:?}", errors);
         debug!("Open Sockets found: {:?}", &open_sockets);
         open_sockets
     }
