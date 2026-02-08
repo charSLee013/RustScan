@@ -11,12 +11,14 @@ use rustscan::{detail, funny_opening, output, warning};
 
 use colorful::{Color, Colorful};
 use futures::executor::block_on;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::str::FromStr;
 use std::string::ToString;
 use std::time::Duration;
 
-use rustscan::address::parse_addresses;
+use cidr_utils::cidr::IpInet;
+use rustscan::address::{parse_addresses, AddressStream};
 
 extern crate colorful;
 extern crate dirs;
@@ -66,15 +68,8 @@ fn main() {
         print_opening(&opts);
     }
 
-    let ips: Vec<IpAddr> = parse_addresses(&opts);
-
-    if ips.is_empty() {
-        warning!(
-            "No IPs could be resolved, aborting scan.",
-            opts.greppable,
-            opts.accessible
-        );
-        std::process::exit(1);
+    if !opts.stream {
+        warn_large_cidrs(&opts);
     }
 
     #[cfg(unix)]
@@ -83,48 +78,135 @@ fn main() {
     #[cfg(not(unix))]
     let batch_size: usize = AVERAGE_BATCH_SIZE;
 
-    let scanner = Scanner::new(
-        &ips,
-        batch_size,
-        Duration::from_millis(opts.timeout.into()),
-        opts.tries,
-        opts.greppable,
-        PortStrategy::pick(&opts.range, opts.ports, opts.scan_order),
-        opts.accessible,
-        opts.exclude_ports.unwrap_or_default(),
-        opts.udp,
-    );
-    debug!("Scanner finished building: {scanner:?}");
-
-    let mut portscan_bench = NamedTimer::start("Portscan");
-    let scan_result = block_on(scanner.run());
-    portscan_bench.end();
-    benchmarks.push(portscan_bench);
-
     let mut ports_per_ip = HashMap::new();
+    let mut portscan_bench = NamedTimer::start("Portscan");
+    let mut stream_total_scanned_ips: u64 = 0;
+    if opts.stream {
+        let mut ports =
+            PortStrategy::pick(&opts.range, opts.ports.clone(), opts.scan_order).order();
 
-    for socket in scan_result {
-        ports_per_ip
-            .entry(socket.ip())
-            .or_insert_with(Vec::new)
-            .push(socket.port());
-    }
-
-    for ip in ips {
-        if ports_per_ip.contains_key(&ip) {
-            continue;
+        if let Some(exclude_ports) = &opts.exclude_ports {
+            if !exclude_ports.is_empty() {
+                let exclude_ports: HashSet<u16> = exclude_ports.iter().copied().collect();
+                ports.retain(|port| !exclude_ports.contains(port));
+            }
         }
 
-        // If we got here it means the IP was not found within the HashMap, this
-        // means the scan couldn't find any open ports for it.
+        let ports_len = ports.len().max(1);
+        const MIN_IPS_PER_CHUNK: usize = 256;
+        const MAX_IPS_PER_CHUNK: usize = 100_000;
+        let ips_per_chunk = ((batch_size + ports_len - 1) / ports_len)
+            .max(MIN_IPS_PER_CHUNK)
+            .clamp(1, MAX_IPS_PER_CHUNK);
 
-        let x = format!("Looks like I didn't find any open ports for {:?}. This is usually caused by a high batch size.
+        let mut addr_stream = AddressStream::new(&opts);
+        loop {
+            let chunk = addr_stream.by_ref().take(ips_per_chunk).collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+
+            stream_total_scanned_ips += chunk.len() as u64;
+
+            let scanner = Scanner::new(
+                &chunk,
+                batch_size,
+                Duration::from_millis(opts.timeout.into()),
+                opts.tries,
+                opts.greppable,
+                PortStrategy::Manual(Vec::new()),
+                opts.accessible,
+                Vec::new(),
+                opts.udp,
+            );
+
+            for socket in block_on(scanner.run_with_ports(&ports)) {
+                ports_per_ip
+                    .entry(socket.ip())
+                    .or_insert_with(Vec::new)
+                    .push(socket.port());
+            }
+        }
+
+        if stream_total_scanned_ips == 0 {
+            warning!(
+                "No IPs could be resolved, aborting scan.",
+                opts.greppable,
+                opts.accessible
+            );
+            std::process::exit(1);
+        }
+    } else {
+        let ips: Vec<IpAddr> = parse_addresses(&opts);
+
+        if ips.is_empty() {
+            warning!(
+                "No IPs could be resolved, aborting scan.",
+                opts.greppable,
+                opts.accessible
+            );
+            std::process::exit(1);
+        }
+
+        let scanner = Scanner::new(
+            &ips,
+            batch_size,
+            Duration::from_millis(opts.timeout.into()),
+            opts.tries,
+            opts.greppable,
+            PortStrategy::pick(&opts.range, opts.ports, opts.scan_order),
+            opts.accessible,
+            opts.exclude_ports.unwrap_or_default(),
+            opts.udp,
+        );
+        debug!("Scanner finished building: {scanner:?}");
+
+        for socket in block_on(scanner.run()) {
+            ports_per_ip
+                .entry(socket.ip())
+                .or_insert_with(Vec::new)
+                .push(socket.port());
+        }
+
+        for ip in ips {
+            if ports_per_ip.contains_key(&ip) {
+                continue;
+            }
+
+            // If we got here it means the IP was not found within the HashMap, this
+            // means the scan couldn't find any open ports for it.
+
+            let x = format!("Looks like I didn't find any open ports for {:?}. This is usually caused by a high batch size.
         \n*I used {} batch size, consider lowering it with {} or a comfortable number for your system.
         \n Alternatively, increase the timeout if your ping is high. Rustscan -t 2000 for 2000 milliseconds (2s) timeout.\n",
         ip,
         opts.batch_size,
         "'rustscan -b <batch_size> -a <ip address>'");
-        warning!(x, opts.greppable, opts.accessible);
+            warning!(x, opts.greppable, opts.accessible);
+        }
+    }
+
+    portscan_bench.end();
+    benchmarks.push(portscan_bench);
+
+    if opts.stream {
+        detail!(
+            format!(
+                "Stream mode scanned {stream_total_scanned_ips} IPs; found open ports on {} IPs.",
+                ports_per_ip.len()
+            ),
+            opts.greppable,
+            opts.accessible
+        );
+
+        if ports_per_ip.is_empty() {
+            let x = format!("Looks like I didn't find any open ports. This is usually caused by a high batch size.
+        \n*I used {} batch size, consider lowering it with {} or a comfortable number for your system.
+        \n Alternatively, increase the timeout if your ping is high. Rustscan -t 2000 for 2000 milliseconds (2s) timeout.\n",
+        opts.batch_size,
+        "'rustscan -b <batch_size> -a <ip address>'");
+            warning!(x, opts.greppable, opts.accessible);
+        }
     }
 
     let mut script_bench = NamedTimer::start("Scripts");
@@ -229,6 +311,41 @@ The Modern Day Port Scanner."#;
             opts.greppable,
             opts.accessible
         );
+    }
+}
+
+fn warn_large_cidrs(opts: &Opts) {
+    const LARGE_CIDR_THRESHOLD: u128 = 1_000_000;
+
+    for address in &opts.addresses {
+        let Ok(net) = IpInet::from_str(address) else {
+            continue;
+        };
+
+        if cidr_size_at_least(&net, LARGE_CIDR_THRESHOLD) {
+            warning!(
+                format!("Large CIDR detected ({address}). Consider using --stream to reduce memory usage on low-memory systems."),
+                opts.greppable,
+                opts.accessible
+            );
+            break;
+        }
+    }
+}
+
+fn cidr_size_at_least(net: &IpInet, threshold: u128) -> bool {
+    match net {
+        IpInet::V4(inet) => {
+            let host_bits = 32u32.saturating_sub(u32::from(inet.network_length()));
+            (1u128 << host_bits) >= threshold
+        }
+        IpInet::V6(inet) => {
+            let host_bits = 128u32.saturating_sub(u32::from(inet.network_length()));
+            if host_bits >= 128 {
+                return true;
+            }
+            (1u128 << host_bits) >= threshold
+        }
     }
 }
 

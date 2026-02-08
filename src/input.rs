@@ -76,6 +76,12 @@ pub struct Opts {
     #[arg(short, long, value_delimiter = ',')]
     pub addresses: Vec<String>,
 
+    /// Stream CIDR expansion instead of pre-expanding all targets into memory.
+    ///
+    /// This is useful when scanning very large CIDRs on low-memory systems.
+    #[arg(long)]
+    pub stream: bool,
+
     /// A list of comma separated ports to be scanned. Example: 80,443,8080.
     #[arg(short, long, value_delimiter = ',')]
     pub ports: Option<Vec<u16>>,
@@ -228,6 +234,7 @@ impl Default for Opts {
     fn default() -> Self {
         Self {
             addresses: vec![],
+            stream: false,
             ports: None,
             range: None,
             greppable: true,
@@ -373,6 +380,12 @@ mod tests {
     #[test]
     fn verify_cli() {
         Opts::command().debug_assert();
+    }
+
+    #[test]
+    fn parse_stream_flag() {
+        let opts = Opts::parse_from(["rustscan", "-a", "127.0.0.1", "--stream"]);
+        assert!(opts.stream);
     }
 
     #[parameterized(input = {

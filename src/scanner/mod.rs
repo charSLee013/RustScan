@@ -70,14 +70,29 @@ impl Scanner {
     /// If you want to run RustScan normally, this is the entry point used
     /// Returns all open ports as `Vec<u16>`
     pub async fn run(&self) -> Vec<SocketAddr> {
-        let ports: Vec<u16> = self
-            .port_strategy
+        let ports = self.build_ports();
+        self.run_inner(&ports).await
+    }
+
+    /// Runs the scanner using a pre-computed list of ports.
+    ///
+    /// This is useful in situations where ports are constant across multiple scan runs (e.g. when
+    /// scanning targets in chunks) and we want to avoid regenerating large port vectors repeatedly.
+    pub async fn run_with_ports(&self, ports: &[u16]) -> Vec<SocketAddr> {
+        self.run_inner(ports).await
+    }
+
+    fn build_ports(&self) -> Vec<u16> {
+        self.port_strategy
             .order()
             .iter()
             .filter(|&port| !self.exclude_ports.contains(port))
             .copied()
-            .collect();
-        let mut socket_iterator: SocketIterator = SocketIterator::new(&self.ips, &ports);
+            .collect()
+    }
+
+    async fn run_inner(&self, ports: &[u16]) -> Vec<SocketAddr> {
+        let mut socket_iterator: SocketIterator = SocketIterator::new(&self.ips, ports);
         let mut open_sockets: Vec<SocketAddr> = Vec::new();
         let mut ftrs = FuturesUnordered::new();
         let mut errors: HashSet<String> = HashSet::new();
@@ -85,7 +100,7 @@ impl Scanner {
 
         for _ in 0..self.batch_size {
             if let Some(socket) = socket_iterator.next() {
-                ftrs.push(self.scan_socket(socket, udp_map.clone()));
+                ftrs.push(self.scan_socket(socket, udp_map));
             } else {
                 break;
             }
@@ -99,7 +114,7 @@ impl Scanner {
 
         while let Some(result) = ftrs.next().await {
             if let Some(socket) = socket_iterator.next() {
-                ftrs.push(self.scan_socket(socket, udp_map.clone()));
+                ftrs.push(self.scan_socket(socket, udp_map));
             }
 
             match result {
@@ -134,7 +149,7 @@ impl Scanner {
     async fn scan_socket(
         &self,
         socket: SocketAddr,
-        udp_map: BTreeMap<Vec<u16>, Vec<u8>>,
+        udp_map: &'static BTreeMap<Vec<u16>, Vec<u8>>,
     ) -> io::Result<SocketAddr> {
         if self.udp {
             return self.scan_udp_socket(socket, udp_map).await;
@@ -175,9 +190,9 @@ impl Scanner {
     async fn scan_udp_socket(
         &self,
         socket: SocketAddr,
-        udp_map: BTreeMap<Vec<u16>, Vec<u8>>,
+        udp_map: &'static BTreeMap<Vec<u16>, Vec<u8>>,
     ) -> io::Result<SocketAddr> {
-        let mut payload: Vec<u8> = Vec::new();
+        let mut payload: &[u8] = &[];
         for (key, value) in udp_map {
             if key.contains(&socket.port()) {
                 payload = value;
@@ -186,7 +201,7 @@ impl Scanner {
 
         let tries = self.tries.get();
         for _ in 1..=tries {
-            match self.udp_scan(socket, &payload, self.timeout).await {
+            match self.udp_scan(socket, payload, self.timeout).await {
                 Ok(true) => return Ok(socket),
                 Ok(false) => continue,
                 Err(e) => return Err(e),

@@ -1,12 +1,12 @@
 //! Provides functions to parse input IP addresses, CIDRs or files.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::str::FromStr;
 
-use cidr_utils::cidr::{IpCidr, IpInet};
+use cidr_utils::cidr::{InetAddressIterator, IpCidr, IpInet};
 use hickory_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     Resolver,
@@ -76,6 +76,148 @@ pub fn parse_addresses(input: &Opts) -> Vec<IpAddr> {
     ips.retain(|ip| seen.insert(*ip) && !excluded_cidrs.iter().any(|cidr| cidr.contains(ip)));
 
     ips
+}
+
+/// Streams resolved IP addresses without pre-expanding CIDRs into a single Vec.
+///
+/// This is intended for very large CIDRs where [`parse_addresses`] would allocate an
+/// impractical amount of memory.
+pub struct AddressStream<'a> {
+    input: &'a Opts,
+    backup_resolver: Resolver,
+    excluded_cidrs: Vec<IpCidr>,
+    addr_index: usize,
+    pending: VecDeque<IpAddr>,
+    cidr_iter: Option<InetAddressIterator<IpAddr>>,
+    file_lines: Option<std::io::Lines<BufReader<File>>>,
+}
+
+impl<'a> AddressStream<'a> {
+    pub fn new(input: &'a Opts) -> Self {
+        let backup_resolver = get_resolver(&input.resolver);
+        let excluded_cidrs = parse_excluded_networks(&input.exclude_addresses, &backup_resolver);
+
+        Self {
+            input,
+            backup_resolver,
+            excluded_cidrs,
+            addr_index: 0,
+            pending: VecDeque::new(),
+            cidr_iter: None,
+            file_lines: None,
+        }
+    }
+
+    fn is_excluded(&self, ip: &IpAddr) -> bool {
+        self.excluded_cidrs.iter().any(|cidr| cidr.contains(ip))
+    }
+
+    fn fill_from_address(&mut self, address: &str, allow_file: bool) {
+        if let Ok(addr) = IpAddr::from_str(address) {
+            self.pending.push_back(addr);
+            return;
+        }
+
+        if let Ok(net_addr) = IpInet::from_str(address) {
+            self.cidr_iter = Some(net_addr.network().iter().addresses());
+            return;
+        }
+
+        // `address` is a hostname or DNS name
+        // attempt default DNS lookup
+        if let Ok(mut iter) = format!("{address}:80").to_socket_addrs() {
+            if let Some(addr) = iter.next() {
+                self.pending.push_back(addr.ip());
+                return;
+            }
+        }
+
+        // default lookup didn't work, so try again with the dedicated resolver
+        let resolved = resolve_ips_from_host(address, &self.backup_resolver);
+        if !resolved.is_empty() {
+            self.pending.extend(resolved);
+            return;
+        }
+
+        if !allow_file {
+            debug!("Line in file is not valid");
+            return;
+        }
+
+        let file_path = Path::new(address);
+        if !file_path.is_file() {
+            warning!(
+                format!("Host {file_path:?} could not be resolved."),
+                self.input.greppable,
+                self.input.accessible
+            );
+            return;
+        }
+
+        match File::open(file_path) {
+            Ok(file) => self.file_lines = Some(BufReader::new(file).lines()),
+            Err(_) => warning!(
+                format!("Host {file_path:?} could not be resolved."),
+                self.input.greppable,
+                self.input.accessible
+            ),
+        }
+    }
+}
+
+impl Iterator for AddressStream<'_> {
+    type Item = IpAddr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ip) = self.pending.pop_front() {
+                if self.is_excluded(&ip) {
+                    continue;
+                }
+                return Some(ip);
+            }
+
+            if let Some(iter) = self.cidr_iter.as_mut() {
+                match iter.next() {
+                    Some(ip) => {
+                        if self.is_excluded(&ip) {
+                            continue;
+                        }
+                        return Some(ip);
+                    }
+                    None => {
+                        self.cidr_iter = None;
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(lines) = self.file_lines.as_mut() {
+                match lines.next() {
+                    Some(Ok(line)) => {
+                        self.fill_from_address(line.trim(), false);
+                        continue;
+                    }
+                    Some(Err(_)) => {
+                        debug!("Line in file is not valid");
+                        continue;
+                    }
+                    None => {
+                        self.file_lines = None;
+                        continue;
+                    }
+                }
+            }
+
+            if self.addr_index >= self.input.addresses.len() {
+                return None;
+            }
+
+            let address = &self.input.addresses[self.addr_index];
+            self.addr_index += 1;
+            self.fill_from_address(address, true);
+        }
+    }
 }
 
 /// Given a string, parse it as a host, IP address, or CIDR.
@@ -236,7 +378,7 @@ fn read_ips_from_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_resolver, parse_addresses, Opts};
+    use super::{get_resolver, parse_addresses, AddressStream, Opts};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -430,5 +572,65 @@ mod tests {
         let lookup = resolver.lookup_ip("www.example.com.").unwrap();
 
         assert!(lookup.iter().next().is_some());
+    }
+
+    #[test]
+    fn stream_cidr_small() {
+        let opts = Opts {
+            addresses: vec!["192.168.0.0/30".to_owned()],
+            ..Default::default()
+        };
+
+        let ips = AddressStream::new(&opts).collect::<Vec<_>>();
+
+        assert_eq!(
+            ips,
+            [
+                Ipv4Addr::new(192, 168, 0, 0),
+                Ipv4Addr::new(192, 168, 0, 1),
+                Ipv4Addr::new(192, 168, 0, 2),
+                Ipv4Addr::new(192, 168, 0, 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_exclusions_work() {
+        let opts = Opts {
+            addresses: vec!["192.168.0.0/29".to_owned()],
+            exclude_addresses: Some(vec!["192.168.0.0/30".to_owned()]),
+            ..Default::default()
+        };
+
+        let ips = AddressStream::new(&opts).collect::<Vec<_>>();
+
+        assert_eq!(
+            ips,
+            [
+                Ipv4Addr::new(192, 168, 0, 4),
+                Ipv4Addr::new(192, 168, 0, 5),
+                Ipv4Addr::new(192, 168, 0, 6),
+                Ipv4Addr::new(192, 168, 0, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_does_not_preexpand_huge() {
+        let opts = Opts {
+            addresses: vec!["0.0.0.0/0".to_owned()],
+            ..Default::default()
+        };
+
+        let ips = AddressStream::new(&opts).take(3).collect::<Vec<_>>();
+
+        assert_eq!(
+            ips,
+            [
+                Ipv4Addr::new(0, 0, 0, 0),
+                Ipv4Addr::new(0, 0, 0, 1),
+                Ipv4Addr::new(0, 0, 0, 2),
+            ]
+        );
     }
 }
