@@ -1,34 +1,37 @@
-name: Test
+name: CI
+
 on:
-  pull_request:
-    branches: [master]
+  pull_request: {}
   push:
     branches:
       - master
+
 jobs:
-  test:
-    name: Test Suite
+  ci:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable]
-    runs-on: ${{ matrix.os }}
+
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
+          components: rustfmt
 
-      - uses: taiki-e/install-action@nextest
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
 
-      - name: Install Just
-        uses: extractions/setup-just@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: Run just
-        run: just test
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
