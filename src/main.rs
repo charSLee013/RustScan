@@ -11,15 +11,16 @@ use rustscan::{detail, funny_opening, output, warning};
 
 use colorful::{Color, Colorful};
 use futures::executor::block_on;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::string::ToString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cidr_utils::cidr::IpInet;
 use rustscan::address::{parse_addresses, AddressStream};
@@ -96,15 +97,12 @@ fn main() {
             .max(MIN_IPS_PER_CHUNK)
             .clamp(1, MAX_IPS_PER_CHUNK);
 
-        let progress = if opts.disable_progress {
-            None
-        } else {
-            Some(ScanProgress::new(ports.len() as u64, None))
-        };
+        let progress =
+            should_show_progress(&opts).then(|| ScanProgress::new(ports.len() as u64, None));
         let progress_thread = progress.as_ref().map(|progress| {
-            spawn_progress_printer(
+            spawn_progress_bar(
                 progress.clone(),
-                &opts,
+                true,
                 batch_size,
                 Duration::from_millis(opts.timeout.into()),
                 std::cmp::max(opts.tries, 1),
@@ -177,21 +175,15 @@ fn main() {
             std::process::exit(1);
         }
 
-        let progress = if opts.disable_progress {
-            None
-        } else {
-            Some(ScanProgress::new(
-                ports.len() as u64,
-                Some(ips.len() as u64),
-            ))
-        };
+        let progress = should_show_progress(&opts)
+            .then(|| ScanProgress::new(ports.len() as u64, Some(ips.len() as u64)));
         if let Some(progress) = &progress {
             progress.add_resolved_ips(ips.len() as u64);
         }
         let progress_thread = progress.as_ref().map(|progress| {
-            spawn_progress_printer(
+            spawn_progress_bar(
                 progress.clone(),
-                &opts,
+                false,
                 batch_size,
                 Duration::from_millis(opts.timeout.into()),
                 std::cmp::max(opts.tries, 1),
@@ -426,66 +418,65 @@ fn build_ports(opts: &Opts) -> Vec<u16> {
     ports
 }
 
-fn spawn_progress_printer(
+fn should_show_progress(opts: &Opts) -> bool {
+    !opts.disable_progress && !opts.accessible && std::io::stderr().is_terminal()
+}
+
+fn spawn_progress_bar(
     progress: Arc<ScanProgress>,
-    opts: &Opts,
+    is_stream: bool,
     batch_size: usize,
     timeout: Duration,
     tries: u8,
 ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
-    let accessible = opts.accessible;
-    let greppable = opts.greppable;
 
     let handle = std::thread::spawn(move || {
-        let stderr_is_tty = std::io::stderr().is_terminal();
-        let use_overwrite_line = stderr_is_tty && !accessible && greppable;
-        let interval = if use_overwrite_line {
-            Duration::from_millis(250)
+        let pb = if is_stream {
+            ProgressBar::new_spinner()
         } else {
-            Duration::from_secs(1)
+            let total_sockets = progress.snapshot().total_sockets.unwrap_or(0);
+            ProgressBar::new(total_sockets)
         };
 
-        let mut last_completed = 0u64;
-        let mut last_instant = Instant::now();
+        pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+
+        if is_stream {
+            let style = ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {human_pos:>10} {per_sec} {wide_msg}",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_spinner());
+            pb.set_style(style);
+        } else {
+            let style = ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {human_pos:>10}/{human_len:10} {per_sec} eta {eta_precise} {wide_msg}",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-");
+            pb.set_style(style);
+        }
 
         while !stop_thread.load(Ordering::Relaxed) {
             let snapshot = progress.snapshot();
-            let now = Instant::now();
-            let delta_completed = snapshot.completed_sockets.saturating_sub(last_completed);
-            let delta_secs = now
-                .duration_since(last_instant)
-                .as_secs_f64()
-                .max(f64::EPSILON);
-            let rate = (delta_completed as f64) / delta_secs;
-
-            last_completed = snapshot.completed_sockets;
-            last_instant = now;
-
-            let line = render_progress_line(&snapshot, rate, batch_size, timeout, tries);
-
-            if use_overwrite_line {
-                eprint!("\r{line}");
-                let _ = std::io::stderr().flush();
-            } else {
-                eprintln!("{line}");
+            pb.set_position(snapshot.completed_sockets);
+            pb.set_message(format_progress_message(
+                &snapshot, batch_size, timeout, tries,
+            ));
+            if is_stream {
+                pb.tick();
             }
-
-            std::thread::sleep(interval);
+            std::thread::sleep(Duration::from_millis(120));
         }
 
-        if use_overwrite_line {
-            eprintln!();
-        }
+        pb.finish();
     });
 
     (stop, handle)
 }
 
-fn render_progress_line(
+fn format_progress_message(
     snapshot: &ProgressSnapshot,
-    rate: f64,
     batch_size: usize,
     timeout: Duration,
     tries: u8,
@@ -494,36 +485,20 @@ fn render_progress_line(
         .total_ips
         .map(|v| v.to_string())
         .unwrap_or_else(|| "?".to_owned());
-    let total_sockets = snapshot
-        .total_sockets
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "?".to_owned());
     let last = snapshot
         .last_socket
         .map(|s| s.to_string())
         .unwrap_or_else(|| "-".to_owned());
 
-    let elapsed = format_elapsed(snapshot.elapsed);
-    let sockets_done = snapshot.completed_sockets;
-
     format!(
-        "ips={}/{total_ips} ports={} sockets={sockets_done}/{total_sockets} inflight={} open_sockets={} open_ips={} last={last} rate={:.0}/s elapsed={elapsed} batch={batch_size} timeout={}ms tries={tries}",
+        "ips={}/{total_ips} ports={} inflight={} open_sockets={} open_ips={} cur={last} batch={batch_size} timeout={}ms tries={tries}",
         snapshot.resolved_ips,
         snapshot.ports_total,
         snapshot.inflight(),
         snapshot.open_sockets,
         snapshot.open_ips,
-        rate,
         timeout.as_millis(),
     )
-}
-
-fn format_elapsed(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let seconds = seconds % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 #[cfg(unix)]
