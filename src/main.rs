@@ -11,14 +11,19 @@ use rustscan::{detail, funny_opening, output, warning};
 
 use colorful::{Color, Colorful};
 use futures::executor::block_on;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::string::ToString;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cidr_utils::cidr::IpInet;
 use rustscan::address::{parse_addresses, AddressStream};
+use rustscan::progress::{ProgressSnapshot, ScanProgress};
 
 extern crate colorful;
 extern crate dirs;
@@ -78,26 +83,33 @@ fn main() {
     #[cfg(not(unix))]
     let batch_size: usize = AVERAGE_BATCH_SIZE;
 
-    let mut ports_per_ip = HashMap::new();
+    let ports = build_ports(&opts);
+
+    let mut ports_per_ip: HashMap<IpAddr, Vec<u16>> = HashMap::new();
     let mut portscan_bench = NamedTimer::start("Portscan");
     let mut stream_total_scanned_ips: u64 = 0;
     if opts.stream {
-        let mut ports =
-            PortStrategy::pick(&opts.range, opts.ports.clone(), opts.scan_order).order();
-
-        if let Some(exclude_ports) = &opts.exclude_ports {
-            if !exclude_ports.is_empty() {
-                let exclude_ports: HashSet<u16> = exclude_ports.iter().copied().collect();
-                ports.retain(|port| !exclude_ports.contains(port));
-            }
-        }
-
         let ports_len = ports.len().max(1);
         const MIN_IPS_PER_CHUNK: usize = 256;
         const MAX_IPS_PER_CHUNK: usize = 100_000;
         let ips_per_chunk = ((batch_size + ports_len - 1) / ports_len)
             .max(MIN_IPS_PER_CHUNK)
             .clamp(1, MAX_IPS_PER_CHUNK);
+
+        let progress = if opts.disable_progress {
+            None
+        } else {
+            Some(ScanProgress::new(ports.len() as u64, None))
+        };
+        let progress_thread = progress.as_ref().map(|progress| {
+            spawn_progress_printer(
+                progress.clone(),
+                &opts,
+                batch_size,
+                Duration::from_millis(opts.timeout.into()),
+                std::cmp::max(opts.tries, 1),
+            )
+        });
 
         let mut addr_stream = AddressStream::new(&opts);
         loop {
@@ -107,6 +119,9 @@ fn main() {
             }
 
             stream_total_scanned_ips += chunk.len() as u64;
+            if let Some(progress) = &progress {
+                progress.add_resolved_ips(chunk.len() as u64);
+            }
 
             let scanner = Scanner::new(
                 &chunk,
@@ -119,13 +134,27 @@ fn main() {
                 Vec::new(),
                 opts.udp,
             );
+            let scanner = match &progress {
+                Some(progress) => scanner.with_progress(progress.clone()),
+                None => scanner,
+            };
 
             for socket in block_on(scanner.run_with_ports(&ports)) {
-                ports_per_ip
-                    .entry(socket.ip())
-                    .or_insert_with(Vec::new)
-                    .push(socket.port());
+                match ports_per_ip.entry(socket.ip()) {
+                    Entry::Occupied(mut entry) => entry.get_mut().push(socket.port()),
+                    Entry::Vacant(entry) => {
+                        if let Some(progress) = &progress {
+                            progress.inc_open_ips(1);
+                        }
+                        entry.insert(vec![socket.port()]);
+                    }
+                }
             }
+        }
+
+        if let Some((stop, handle)) = progress_thread {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
         }
 
         if stream_total_scanned_ips == 0 {
@@ -148,24 +177,59 @@ fn main() {
             std::process::exit(1);
         }
 
+        let progress = if opts.disable_progress {
+            None
+        } else {
+            Some(ScanProgress::new(
+                ports.len() as u64,
+                Some(ips.len() as u64),
+            ))
+        };
+        if let Some(progress) = &progress {
+            progress.add_resolved_ips(ips.len() as u64);
+        }
+        let progress_thread = progress.as_ref().map(|progress| {
+            spawn_progress_printer(
+                progress.clone(),
+                &opts,
+                batch_size,
+                Duration::from_millis(opts.timeout.into()),
+                std::cmp::max(opts.tries, 1),
+            )
+        });
+
         let scanner = Scanner::new(
             &ips,
             batch_size,
             Duration::from_millis(opts.timeout.into()),
             opts.tries,
             opts.greppable,
-            PortStrategy::pick(&opts.range, opts.ports, opts.scan_order),
+            PortStrategy::Manual(Vec::new()),
             opts.accessible,
-            opts.exclude_ports.unwrap_or_default(),
+            Vec::new(),
             opts.udp,
         );
+        let scanner = match &progress {
+            Some(progress) => scanner.with_progress(progress.clone()),
+            None => scanner,
+        };
         debug!("Scanner finished building: {scanner:?}");
 
-        for socket in block_on(scanner.run()) {
-            ports_per_ip
-                .entry(socket.ip())
-                .or_insert_with(Vec::new)
-                .push(socket.port());
+        for socket in block_on(scanner.run_with_ports(&ports)) {
+            match ports_per_ip.entry(socket.ip()) {
+                Entry::Occupied(mut entry) => entry.get_mut().push(socket.port()),
+                Entry::Vacant(entry) => {
+                    if let Some(progress) = &progress {
+                        progress.inc_open_ips(1);
+                    }
+                    entry.insert(vec![socket.port()]);
+                }
+            }
+        }
+
+        if let Some((stop, handle)) = progress_thread {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
         }
 
         for ip in ips {
@@ -347,6 +411,119 @@ fn cidr_size_at_least(net: &IpInet, threshold: u128) -> bool {
             (1u128 << host_bits) >= threshold
         }
     }
+}
+
+fn build_ports(opts: &Opts) -> Vec<u16> {
+    let mut ports = PortStrategy::pick(&opts.range, opts.ports.clone(), opts.scan_order).order();
+
+    if let Some(exclude_ports) = &opts.exclude_ports {
+        if !exclude_ports.is_empty() {
+            let exclude_ports: HashSet<u16> = exclude_ports.iter().copied().collect();
+            ports.retain(|port| !exclude_ports.contains(port));
+        }
+    }
+
+    ports
+}
+
+fn spawn_progress_printer(
+    progress: Arc<ScanProgress>,
+    opts: &Opts,
+    batch_size: usize,
+    timeout: Duration,
+    tries: u8,
+) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let accessible = opts.accessible;
+    let greppable = opts.greppable;
+
+    let handle = std::thread::spawn(move || {
+        let stderr_is_tty = std::io::stderr().is_terminal();
+        let use_overwrite_line = stderr_is_tty && !accessible && greppable;
+        let interval = if use_overwrite_line {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(1)
+        };
+
+        let mut last_completed = 0u64;
+        let mut last_instant = Instant::now();
+
+        while !stop_thread.load(Ordering::Relaxed) {
+            let snapshot = progress.snapshot();
+            let now = Instant::now();
+            let delta_completed = snapshot.completed_sockets.saturating_sub(last_completed);
+            let delta_secs = now
+                .duration_since(last_instant)
+                .as_secs_f64()
+                .max(f64::EPSILON);
+            let rate = (delta_completed as f64) / delta_secs;
+
+            last_completed = snapshot.completed_sockets;
+            last_instant = now;
+
+            let line = render_progress_line(&snapshot, rate, batch_size, timeout, tries);
+
+            if use_overwrite_line {
+                eprint!("\r{line}");
+                let _ = std::io::stderr().flush();
+            } else {
+                eprintln!("{line}");
+            }
+
+            std::thread::sleep(interval);
+        }
+
+        if use_overwrite_line {
+            eprintln!();
+        }
+    });
+
+    (stop, handle)
+}
+
+fn render_progress_line(
+    snapshot: &ProgressSnapshot,
+    rate: f64,
+    batch_size: usize,
+    timeout: Duration,
+    tries: u8,
+) -> String {
+    let total_ips = snapshot
+        .total_ips
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let total_sockets = snapshot
+        .total_sockets
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let last = snapshot
+        .last_socket
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+
+    let elapsed = format_elapsed(snapshot.elapsed);
+    let sockets_done = snapshot.completed_sockets;
+
+    format!(
+        "ips={}/{total_ips} ports={} sockets={sockets_done}/{total_sockets} inflight={} open_sockets={} open_ips={} last={last} rate={:.0}/s elapsed={elapsed} batch={batch_size} timeout={}ms tries={tries}",
+        snapshot.resolved_ips,
+        snapshot.ports_total,
+        snapshot.inflight(),
+        snapshot.open_sockets,
+        snapshot.open_ips,
+        rate,
+        timeout.as_millis(),
+    )
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 #[cfg(unix)]

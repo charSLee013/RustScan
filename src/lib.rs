@@ -56,3 +56,5 @@ pub mod scripts;
 pub mod address;
 
 pub mod generated;
+
+pub mod progress;

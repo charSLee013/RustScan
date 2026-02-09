@@ -82,6 +82,12 @@ pub struct Opts {
     #[arg(long)]
     pub stream: bool,
 
+    /// Disable periodic progress output.
+    ///
+    /// By default RustScan prints progress information to stderr during scanning.
+    #[arg(long)]
+    pub disable_progress: bool,
+
     /// A list of comma separated ports to be scanned. Example: 80,443,8080.
     #[arg(short, long, value_delimiter = ',')]
     pub ports: Option<Vec<u16>>,
@@ -235,6 +241,7 @@ impl Default for Opts {
         Self {
             addresses: vec![],
             stream: false,
+            disable_progress: false,
             ports: None,
             range: None,
             greppable: true,
@@ -386,6 +393,12 @@ mod tests {
     fn parse_stream_flag() {
         let opts = Opts::parse_from(["rustscan", "-a", "127.0.0.1", "--stream"]);
         assert!(opts.stream);
+    }
+
+    #[test]
+    fn parse_disable_progress_flag() {
+        let opts = Opts::parse_from(["rustscan", "-a", "127.0.0.1", "--disable-progress"]);
+        assert!(opts.disable_progress);
     }
 
     #[parameterized(input = {

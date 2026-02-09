@@ -1,6 +1,7 @@
 //! Core functionality for actual scanning behaviour.
 use crate::generated::get_parsed_data;
 use crate::port_strategy::PortStrategy;
+use crate::progress::ScanProgress;
 use log::debug;
 
 mod socket_iterator;
@@ -12,6 +13,7 @@ use async_std::{io, net::UdpSocket};
 use colored::Colorize;
 use futures::stream::FuturesUnordered;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::{
     collections::HashSet,
     net::{IpAddr, Shutdown, SocketAddr},
@@ -37,6 +39,7 @@ pub struct Scanner {
     accessible: bool,
     exclude_ports: Vec<u16>,
     udp: bool,
+    progress: Option<Arc<ScanProgress>>,
 }
 
 // Allowing too many arguments for clippy.
@@ -63,7 +66,13 @@ impl Scanner {
             accessible,
             exclude_ports,
             udp,
+            progress: None,
         }
+    }
+
+    pub fn with_progress(mut self, progress: Arc<ScanProgress>) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     /// Runs scan_range with chunk sizes
@@ -92,15 +101,33 @@ impl Scanner {
     }
 
     async fn run_inner(&self, ports: &[u16]) -> Vec<SocketAddr> {
+        const PUBLISH_EVERY: u64 = 1024;
+        const LAST_SOCKET_EVERY: u64 = 1024;
+
         let mut socket_iterator: SocketIterator = SocketIterator::new(&self.ips, ports);
         let mut open_sockets: Vec<SocketAddr> = Vec::new();
         let mut ftrs = FuturesUnordered::new();
         let mut errors: HashSet<String> = HashSet::new();
         let udp_map = get_parsed_data();
+        let progress = self.progress.as_ref();
+        let mut local_scheduled: u64 = 0;
+        let mut local_completed: u64 = 0;
+        let base_scheduled = progress.map_or(0, |progress| progress.scheduled_sockets());
+        let base_completed = progress.map_or(0, |progress| progress.completed_sockets());
 
         for _ in 0..self.batch_size {
             if let Some(socket) = socket_iterator.next() {
                 ftrs.push(self.scan_socket(socket, udp_map));
+                local_scheduled += 1;
+                if let Some(progress) = progress {
+                    if local_scheduled == 1 || local_scheduled % LAST_SOCKET_EVERY == 0 {
+                        progress.set_last_socket(socket);
+                    }
+
+                    if local_scheduled % PUBLISH_EVERY == 0 {
+                        progress.set_scheduled_sockets(base_scheduled + local_scheduled);
+                    }
+                }
             } else {
                 break;
             }
@@ -115,10 +142,25 @@ impl Scanner {
         while let Some(result) = ftrs.next().await {
             if let Some(socket) = socket_iterator.next() {
                 ftrs.push(self.scan_socket(socket, udp_map));
+                local_scheduled += 1;
+                if let Some(progress) = progress {
+                    if local_scheduled % LAST_SOCKET_EVERY == 0 {
+                        progress.set_last_socket(socket);
+                    }
+
+                    if local_scheduled % PUBLISH_EVERY == 0 {
+                        progress.set_scheduled_sockets(base_scheduled + local_scheduled);
+                    }
+                }
             }
 
             match result {
-                Ok(socket) => open_sockets.push(socket),
+                Ok(socket) => {
+                    open_sockets.push(socket);
+                    if let Some(progress) = progress {
+                        progress.inc_open_sockets(1);
+                    }
+                }
                 Err(e) => {
                     let error_string = e.to_string();
                     if errors.len() < self.ips.len() * 1000 {
@@ -126,6 +168,19 @@ impl Scanner {
                     }
                 }
             }
+
+            local_completed += 1;
+            if let Some(progress) = progress {
+                if local_completed == 1 || local_completed % PUBLISH_EVERY == 0 {
+                    progress.set_scheduled_sockets(base_scheduled + local_scheduled);
+                    progress.set_completed_sockets(base_completed + local_completed);
+                }
+            }
+        }
+
+        if let Some(progress) = progress {
+            progress.set_scheduled_sockets(base_scheduled + local_scheduled);
+            progress.set_completed_sockets(base_completed + local_completed);
         }
         debug!("Typical socket connection errors {errors:?}");
         debug!("Open Sockets found: {:?}", &open_sockets);
@@ -325,6 +380,7 @@ impl Scanner {
 mod tests {
     use super::*;
     use crate::input::{PortRange, ScanOrder};
+    use crate::progress::ScanProgress;
     use async_std::task::block_on;
     use std::{net::IpAddr, time::Duration};
 
@@ -351,6 +407,35 @@ mod tests {
         block_on(scanner.run());
         // if the scan fails, it wouldn't be able to assert_eq! as it panicked!
         assert_eq!(1, 1);
+    }
+
+    #[test]
+    fn scanner_updates_progress_counters() {
+        let addrs = vec!["127.0.0.1".parse::<IpAddr>().unwrap()];
+        let ports = vec![1u16, 2, 3, 4];
+
+        let progress = ScanProgress::new(ports.len() as u64, Some(addrs.len() as u64));
+        progress.add_resolved_ips(addrs.len() as u64);
+
+        let scanner = Scanner::new(
+            &addrs,
+            10,
+            Duration::from_millis(20),
+            1,
+            true,
+            PortStrategy::Manual(Vec::new()),
+            true,
+            Vec::new(),
+            false,
+        )
+        .with_progress(progress.clone());
+
+        block_on(scanner.run_with_ports(&ports));
+
+        let snapshot = progress.snapshot();
+        let expected = (addrs.len() * ports.len()) as u64;
+        assert_eq!(expected, snapshot.scheduled_sockets);
+        assert_eq!(expected, snapshot.completed_sockets);
     }
     #[test]
     fn ipv6_scanner_runs() {
